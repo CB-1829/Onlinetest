@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Horror Game - Sector 7</title>
+    <link rel="icon" type="image/png" href="http://img.itch.zone/aW1hZ2UvMTc2MjgwNS8xMDM2NzQ0OC5wbmc=/original/HHmfxe.png">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body, html { width: 100%; height: 100%; overflow: hidden; background: #000; color: #fff; font-family: 'Courier New', Courier, monospace; }
+        
+        canvas {
+            display: block;
+            width: 100vw !important;
+            height: 100vh !important;
+        }
+
+        #ui {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            background: #000;
+            z-index: 100;
+            text-align: center;
+            transition: opacity 1s;
+        }
+
+        #start-btn {
+            background: transparent;
+            color: #ff0000;
+            border: 2px solid #ff0000;
+            padding: 20px 60px;
+            font-size: 24px;
+            cursor: pointer;
+            text-transform: uppercase;
+            letter-spacing: 10px;
+            box-shadow: 0 0 15px rgba(255, 0, 0, 0.2);
+        }
+
+        #start-btn:hover { background: #ff0000; color: #000; }
+
+        #controls-tip {
+            margin-top: 30px;
+            color: #444;
+            font-size: 14px;
+            line-height: 1.8;
+        }
+
+        #overlay {
+            position: fixed; 
+            top: 20px; 
+            left: 20px; 
+            color: #ff0000; 
+            font-size: 12px; 
+            pointer-events: none; 
+            z-index: 50;
+        }
+
+        #effect-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none;
+            z-index: 40;
+            background: transparent;
+            transition: background 0.1s;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="effect-overlay"></div>
+    <div id="overlay">SECTOR 7 | ASYNC LOADING ENABLED | CHUNK: 60</div>
+
+    <div id="ui">
+        <h1 style="color: #ff0000; font-size: 40px; margin-bottom: 30px; letter-spacing: 5px;">SECTOR 7</h1>
+        <button id="start-btn">INITIALIZE</button>
+        <div id="controls-tip">
+            W / S or ARROWS — MOVE<br>
+            A / D or ARROWS — STRAFE<br>
+            MOUSE — ROTATE LOOK<br>
+            <span id="creative-tip" style="display:none;">C — TOGGLE CREATIVE MODE (NO FOG/FLY)<br></span>
+            DOUBLE SPACE — TOGGLE FLIGHT (GHOST)<br>
+            SPACE (HOLD) / SHIFT — ASCEND / DESCEND
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    
+    <script>
+        // --- GAME CONFIGURATION ---
+        const GAME_CONFIG = {
+            enableCreativeKey: true, 
+            moveSpeed: 0.4,       
+            jumpPower: 0.35,      
+            flySpeed: 1.5,        
+            gravity: -0.012,      
+            lookSensitivity: 0.002, 
+            playerHeight: 1.7,    
+            playerRadius: 0.4,
+            fov: 75,              
+            flashlightDistanceLimit: 120, 
+            simulationDistanceLimit: 4, 
+            chunkSize: 60,             // CHUNK SIZE
+            creativeAmbient: 0.8, 
+            standardAmbient: 0.05, 
+            mapYOffset: 5.0,      
+            flashlightIntensity: 1.5,
+            loadDelayMin: 500,         // Minimum delay for staged loading
+            loadDelayMax: 2500         // Maximum delay for staged loading
+        };
+
+        const ASSET_POOL = {
+            boxGeo: new THREE.BoxGeometry(1, 1, 1),
+            matWall: new THREE.MeshStandardMaterial({ color: 0x151515, roughness: 0.9 }),
+            matFloor: new THREE.MeshStandardMaterial({ color: 0x0a0a0a }),
+            matCeiling: new THREE.MeshStandardMaterial({ color: 0x050505 }),
+            matLightPanel: new THREE.MeshBasicMaterial({ color: 0xffffff }),
+            matFakeSubroom: new THREE.MeshStandardMaterial({ color: 0x2a1a10, roughness: 1.0 }),
+            matIDLabel: new THREE.MeshBasicMaterial({ color: 0x00ff00 })
+        };
+
+        let scene, camera, renderer, flashlight, ambientLight, playerGroup, pitchGroup;
+        let isStarted = false, isCreativeMode = false;
+        const keys = {};
+        
+        let velocityY = 0;
+        let isFlying = false, isGrounded = false;
+        let lastSpaceTime = 0;
+        
+        const mapRegistry = {}; 
+        const activeChunks = new Map(); 
+        let collisionObjects = []; 
+
+        let lastFrameTime = performance.now();
+        let lastPlayerChunk = { x: null, z: null };
+        let screenShake = 0, flashlightFlicker = 1.0; 
+        let effectCooldown = false;
+        let sceneLights = [];
+        let lightDisableZones = [];
+
+        // --- ID GENERATION HELPERS ---
+        function getRoomID(rx, rz) {
+            const alphabet = "abcdefghijklmnopqrstuvwxyz";
+            const letterIndex = Math.abs(rx + 260) % 26;
+            const letter = alphabet[letterIndex];
+            const number = Math.abs(rz) + 1;
+            return `${letter}${number}`;
+        }
+
+        // --- GIANT GLOWING TEXT TEXTURE GENERATION ---
+        function createGlowingTextTexture(text) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            
+            // Clean transparent/black background
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            // Neon glow configurations
+            ctx.shadowColor = '#00ff00';
+            ctx.shadowBlur = 35;
+            ctx.fillStyle = '#39ff14'; // Extreme bright neon green
+            ctx.font = 'bold 120px Courier New';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, 256, 128);
+            
+            // Neon border panel
+            ctx.strokeStyle = '#39ff14';
+            ctx.lineWidth = 8;
+            ctx.strokeRect(15, 15, canvas.width - 30, canvas.height - 30);
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            return texture;
+        }
+
+        // --- VFX AND INTERACTION ---
+        function effect(type, intensity, durationSeconds) {
+            if (type === 'shake') {
+                screenShake = intensity;
+                setTimeout(() => screenShake = 0, durationSeconds * 1000);
+            }
+            if (type === 'flash') {
+                const el = document.getElementById('effect-overlay');
+                el.style.background = `rgba(255, 0, 0, ${intensity})`;
+                setTimeout(() => el.style.background = 'transparent', 100);
+            }
+            if (type === 'flicker') {
+                const startTime = performance.now();
+                const duration = durationSeconds * 1000;
+                const flickerInterval = setInterval(() => {
+                    const elapsed = performance.now() - startTime;
+                    if (elapsed >= duration) {
+                        flashlightFlicker = 1.0;
+                        clearInterval(flickerInterval);
+                        return;
+                    }
+                    flashlightFlicker = Math.random() > 0.85 ? 0 : 0.2 + Math.random() * intensity;
+                }, 50);
+            }
+        }
+
+        function updateInteractiveEntities(deltaTime) {
+            const tec = scene.getObjectByName("testeffect_cube");
+            if (tec) {
+                tec.rotation.y += deltaTime;
+                tec.rotation.z += deltaTime * 0.3;
+                const distTec = playerGroup.position.distanceTo(tec.position);
+                if (distTec < 3.5 && !effectCooldown) {
+                    effect('flicker', 1.0, 3.0);
+                    effect('shake', 0.15, 2.0);
+                    effect('flash', 0.1, 0.1);
+                    effectCooldown = true;
+                    setTimeout(() => effectCooldown = false, 8000);
+                }
+            }
+
+            sceneLights.forEach(item => {
+                if (!item.light.visible) return;
+                if (Math.random() > 0.99) {
+                    item.light.intensity = item.baseIntensity * (Math.random() > 0.5 ? 0.05 : 0);
+                } else if (item.light.intensity < item.baseIntensity) {
+                    item.light.intensity = item.baseIntensity;
+                }
+            });
+
+            let inDarkZone = false;
+            const px = playerGroup.position.x;
+            const pz = playerGroup.position.z;
+            for (let zone of lightDisableZones) {
+                if (px > zone.minX && px < zone.maxX && pz > zone.minZ && pz < zone.maxZ) {
+                    inDarkZone = true;
+                    break;
+                }
+            }
+            
+            if (inDarkZone) {
+                flashlightFlicker = 0;
+            } else if (!effectCooldown) {
+                flashlightFlicker = 1.0; 
+            }
+        }
+
+        function processObjectAnimations() {
+            scene.traverse(child => {
+                if (child.userData && child.userData.moveTask) {
+                    const task = child.userData.moveTask;
+                    const elapsed = performance.now() - task.startTime;
+                    let t = Math.min(elapsed / task.duration, 1);
+                    if (task.smooth || task.animation === 'ease') t = t * t * (3 - 2 * t);
+                    child.position.lerpVectors(task.startPos, task.endPos, t);
+                    if (t >= 1) delete child.userData.moveTask;
+                }
+            });
+        }
+
+        // --- ARCHITECTURE GENERATION ---
+
+        function createWall(group, chunkCollisions, w, h, d, x, y, z, material = null) {
+            const finalY = y + GAME_CONFIG.mapYOffset;
+            const mat = material || ASSET_POOL.matWall;
+            const mesh = new THREE.Mesh(ASSET_POOL.boxGeo, mat);
+            mesh.scale.set(w, h, d);
+            mesh.position.set(x, finalY + h/2, z); 
+            group.add(mesh);
+            chunkCollisions.push({ minX: x - w/2, maxX: x + w/2, minY: finalY, maxY: finalY + h, minZ: z - d/2, maxZ: z + d/2 });
+            return mesh;
+        }
+
+        function createMasterRoom(group, chunkCollisions, rx, rz, px, pz) {
+            const w = 34, d = 34, h = 8;
+            const finalY = GAME_CONFIG.mapYOffset;
+            const wallT = 0.6;
+            const roomID = getRoomID(rx, rz);
+
+            // Door dimensions
+            const doorW = 4.0;
+            const doorH = 5.0;
+
+            // --- STAGE 1: PHYSICAL STRUCTURE (Immediate) ---
+            const floor = new THREE.Mesh(ASSET_POOL.boxGeo, ASSET_POOL.matFloor);
+            floor.scale.set(w, 0.2, d);
+            floor.position.set(px, finalY - 0.1, pz);
+            group.add(floor);
+            chunkCollisions.push({ minX: px - w/2, maxX: px + w/2, minY: finalY - 0.2, maxY: finalY, minZ: pz - d/2, maxZ: pz + d/2 });
+            
+            const ceil = new THREE.Mesh(ASSET_POOL.boxGeo, ASSET_POOL.matCeiling);
+            ceil.scale.set(w, 0.2, d);
+            ceil.position.set(px, finalY + h + 0.1, pz);
+            group.add(ceil);
+
+            // Outer Walls with Door Holes (North and South split, West and East solid)
+            const sideW = (w - doorW) / 2;
+            
+            // North wall (Split into Left & Right sections with Lintel on top)
+            createWall(group, chunkCollisions, sideW, h, wallT, px - doorW/2 - sideW/2, 0, pz - d/2 - wallT/2);
+            createWall(group, chunkCollisions, sideW, h, wallT, px + doorW/2 + sideW/2, 0, pz - d/2 - wallT/2);
+            createWall(group, chunkCollisions, doorW, h - doorH, wallT, px, doorH, pz - d/2 - wallT/2); // Lintel above door
+
+            // South wall (Split into Left & Right sections with Lintel on top)
+            createWall(group, chunkCollisions, sideW, h, wallT, px - doorW/2 - sideW/2, 0, pz + d/2 + wallT/2);
+            createWall(group, chunkCollisions, sideW, h, wallT, px + doorW/2 + sideW/2, 0, pz + d/2 + wallT/2);
+            createWall(group, chunkCollisions, doorW, h - doorH, wallT, px, doorH, pz + d/2 + wallT/2); // Lintel above door
+
+            // West & East walls (remain solid)
+            createWall(group, chunkCollisions, wallT, h, d, px - w/2 - wallT/2, 0, pz); // W
+            createWall(group, chunkCollisions, wallT, h, d, px + w/2 + wallT/2, 0, pz); // E
+
+            // --- STAGE 2: DETAIL, LIGHTS, AND VFX (Delayed) ---
+            const loadDelay = GAME_CONFIG.loadDelayMin + Math.random() * (GAME_CONFIG.loadDelayMax - GAME_CONFIG.loadDelayMin);
+            
+            setTimeout(() => {
+                if (!group.parent) return; // Don't build if chunk was already unloaded
+
+                // Giant Glowing Room ID Sign (Holographic Panel floating in the center of the room)
+                const idTex = createGlowingTextTexture(roomID);
+                const idPlane = new THREE.Mesh(
+                    new THREE.PlaneGeometry(8, 4), 
+                    new THREE.MeshBasicMaterial({ 
+                        map: idTex, 
+                        transparent: true, 
+                        opacity: 0,
+                        side: THREE.DoubleSide
+                    })
+                );
+                idPlane.position.set(px, finalY + h - 2.5, pz); 
+                idPlane.name = "room_id_" + roomID; // Track identifier for rotating animation
+                group.add(idPlane);
+                
+                // Fade in Giant ID sign
+                let opacity = 0;
+                const fadeIn = setInterval(() => {
+                    opacity += 0.05;
+                    idPlane.material.opacity = opacity;
+                    if(opacity >= 1) clearInterval(fadeIn);
+                }, 50);
+
+                // Lighting Logic (1/2 Dark, 1/4 Dark Dark)
+                const isDark = (Math.abs(rx * 11 + rz * 7) % 2 === 0);
+                const isDarkDark = (isDark && Math.abs(rx * 3 + rz * 13) % 2 === 0);
+
+                if (!isDark) {
+                    const lp = new THREE.Mesh(ASSET_POOL.boxGeo, ASSET_POOL.matLightPanel);
+                    lp.scale.set(0.1, 0.1, 0.1); // Start small for pop-in effect
+                    lp.position.set(px, finalY + h - 0.05, pz);
+                    group.add(lp);
+                    
+                    const light = new THREE.PointLight(0xffffff, 0, 40);
+                    light.position.set(px, finalY + h - 1.5, pz);
+                    group.add(light);
+                    
+                    const lightObj = { light, baseIntensity: 1.3 };
+                    sceneLights.push(lightObj);
+
+                    // Animate light turning on
+                    let lightProgress = 0;
+                    const lightOn = setInterval(() => {
+                        lightProgress += 0.1;
+                        lp.scale.set(4 * lightProgress, 0.1, 4 * lightProgress);
+                        light.intensity = 1.3 * lightProgress;
+                        if(lightProgress >= 1) clearInterval(lightOn);
+                    }, 30);
+
+                } else if (isDarkDark) {
+                    lightDisableZones.push({ minX: px - w/2, maxX: px + w/2, minZ: pz - d/2, maxZ: pz + d/2 });
+                }
+
+                // Internal Architecture Details
+                const type = Math.abs((rx * 7 + rz * 3) % 6);
+                if (type === 0) {
+                    const sw = 10, sd = 10;
+                    createWall(group, chunkCollisions, sw, h, wallT, px, 0, pz - sd/2); 
+                    createWall(group, chunkCollisions, sw/3.5, h, wallT, px - sw/2.5, 0, pz + sd/2); 
+                    createWall(group, chunkCollisions, sw/3.5, h, wallT, px + sw/2.5, 0, pz + sd/2); 
+                    createWall(group, chunkCollisions, wallT, h, sd, px - sw/2, 0, pz); 
+                    createWall(group, chunkCollisions, wallT, h, sd, px + sw/2, 0, pz); 
+                }
+                else if (type === 1) {
+                    const sw = 10, sd = 10;
+                    createWall(group, chunkCollisions, sw, h, wallT, px, 0, pz - sd/2); 
+                    createWall(group, chunkCollisions, wallT, h, sd, px - sw/2, 0, pz); 
+                    createWall(group, chunkCollisions, wallT, h, sd, px + sw/2, 0, pz); 
+                    createWall(group, chunkCollisions, sw, h, wallT, px, 0, pz + sd/2, ASSET_POOL.matFakeSubroom); 
+                }
+                else if (type === 2) {
+                    createWall(group, chunkCollisions, w * 0.4, h, wallT * 2, px - w*0.2, 0, pz);
+                    createWall(group, chunkCollisions, w * 0.4, h, wallT * 2, px + w*0.2, 0, pz);
+                    createWall(group, chunkCollisions, wallT * 2, h, d * 0.4, px, 0, pz - d*0.2);
+                    createWall(group, chunkCollisions, wallT * 2, h, d * 0.4, px, 0, pz + d*0.2);
+                }
+                else if (type === 4) {
+                    const pSize = 3;
+                    createWall(group, chunkCollisions, pSize, h, pSize, px - 8, 0, pz - 8);
+                    createWall(group, chunkCollisions, pSize, h, pSize, px + 8, 0, pz - 8);
+                    createWall(group, chunkCollisions, pSize, h, pSize, px - 8, 0, pz + 8);
+                    createWall(group, chunkCollisions, pSize, h, pSize, px + 8, 0, pz + 8);
+                }
+
+                if (rx === 0 && rz === 0) {
+                    const tec = createWall(group, chunkCollisions, 2, 2, 2, px, 0, pz - 6, new THREE.MeshStandardMaterial({ color: 0xff0000 }));
+                    tec.name = "testeffect_cube";
+                }
+
+            }, loadDelay);
+        }
+
+        // --- ENGINE SYSTEMS ---
+
+        function registerToChunk(x, z, buildFunc) {
+            const cx = Math.floor(x / GAME_CONFIG.chunkSize);
+            const cz = Math.floor(z / GAME_CONFIG.chunkSize);
+            const key = `${cx},${cz}`;
+            if (!mapRegistry[key]) mapRegistry[key] = [];
+            mapRegistry[key].push(buildFunc);
+        }
+
+        function updateChunks() {
+            const cx = Math.floor(playerGroup.position.x / GAME_CONFIG.chunkSize);
+            const cz = Math.floor(playerGroup.position.z / GAME_CONFIG.chunkSize);
+            if (cx === lastPlayerChunk.x && cz === lastPlayerChunk.z) return;
+            lastPlayerChunk = { x: cx, z: cz };
+
+            const limit = GAME_CONFIG.simulationDistanceLimit;
+            const neededKeys = new Set();
+
+            for (let x = cx - limit; x <= cx + limit; x++) {
+                for (let z = cz - limit; z <= cz + limit; z++) {
+                    const finalKey = `${x},${z}`;
+                    neededKeys.add(finalKey);
+                    if (!activeChunks.has(finalKey) && mapRegistry[finalKey]) {
+                        const group = new THREE.Group();
+                        const chunkCollisions = [];
+                        mapRegistry[finalKey].forEach(buildFunc => buildFunc(group, chunkCollisions));
+                        scene.add(group);
+                        activeChunks.set(finalKey, { group, collisions: chunkCollisions });
+                    }
+                }
+            }
+
+            for (const [key, data] of activeChunks.entries()) {
+                if (!neededKeys.has(key)) {
+                    sceneLights = sceneLights.filter(l => !data.group.children.includes(l.light));
+                    scene.remove(data.group);
+                    activeChunks.delete(key);
+                }
+            }
+
+            collisionObjects = [];
+            for (const data of activeChunks.values()) {
+                collisionObjects.push(...data.collisions);
+            }
+        }
+
+        function init() {
+            if (GAME_CONFIG.enableCreativeKey) document.getElementById('creative-tip').style.display = 'inline';
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x010101);
+            scene.fog = new THREE.Fog(0x000000, 1, 140);
+
+            playerGroup = new THREE.Group();
+            pitchGroup = new THREE.Group();
+            camera = new THREE.PerspectiveCamera(GAME_CONFIG.fov, window.innerWidth / window.innerHeight, 0.1, 1500);
+            pitchGroup.add(camera);
+            playerGroup.add(pitchGroup);
+            scene.add(playerGroup);
+            playerGroup.position.set(0, GAME_CONFIG.playerHeight + GAME_CONFIG.mapYOffset, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: false }); 
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            flashlight = new THREE.SpotLight(0xffffff, 20, GAME_CONFIG.flashlightDistanceLimit, Math.PI / 2.5, 0.3);
+            camera.add(flashlight);
+            flashlight.target.position.set(0, 0, -1);
+            camera.add(flashlight.target);
+
+            // GRID SETUP (Deterministic rooms spacing)
+            const spacing = 80; 
+            for (let rx = -8; rx <= 8; rx++) {
+                for (let rz = -8; rz <= 8; rz++) {
+                    const px = rx * spacing;
+                    const pz = rz * spacing;
+                    registerToChunk(px, pz, (g, c) => createMasterRoom(g, c, rx, rz, px, pz));
+                }
+            }
+
+            ambientLight = new THREE.AmbientLight(0xffffff, GAME_CONFIG.standardAmbient);
+            scene.add(ambientLight);
+            updateChunks();
+
+            document.addEventListener('mousemove', (e) => {
+                if (isStarted) {
+                    playerGroup.rotation.y -= e.movementX * GAME_CONFIG.lookSensitivity;
+                    pitchGroup.rotation.x -= e.movementY * GAME_CONFIG.lookSensitivity;
+                    pitchGroup.rotation.x = Math.max(-Math.PI/2.2, Math.min(Math.PI/2.2, pitchGroup.rotation.x));
+                }
+            });
+        }
+
+        function checkCollisionXZ(x, z, y) {
+            if (isFlying) return false;
+            const r = GAME_CONFIG.playerRadius;
+            const pyMin = y - GAME_CONFIG.playerHeight + 0.1;
+            const pyMax = y + 0.1;
+            for (let box of collisionObjects) {
+                if (x + r > box.minX && x - r < box.maxX &&
+                    pyMax > box.minY && pyMin < box.maxY &&
+                    z + r > box.minZ && z - r < box.maxZ) return true;
+            }
+            return false;
+        }
+
+        function checkVerticalCollision(y) {
+            if (isFlying) return { grounded: false, y: y };
+            const px = playerGroup.position.x;
+            const pz = playerGroup.position.z;
+            const pyFeet = y - GAME_CONFIG.playerHeight;
+            let grounded = false, finalY = y;
+
+            for (let box of collisionObjects) {
+                if (px + GAME_CONFIG.playerRadius > box.minX && px - GAME_CONFIG.playerRadius < box.maxX && pz + GAME_CONFIG.playerRadius > box.minZ && pz - GAME_CONFIG.playerRadius < box.maxZ) {
+                    if (velocityY <= 0 && pyFeet <= box.maxY && pyFeet >= box.maxY - 0.5) {
+                        finalY = box.maxY + GAME_CONFIG.playerHeight;
+                        grounded = true;
+                    }
+                }
+            }
+            return { grounded, y: finalY };
+        }
+
+        function animate() {
+            const now = performance.now();
+            const deltaTime = (now - lastFrameTime) / 1000;
+            lastFrameTime = now;
+            requestAnimationFrame(animate);
+            
+            if (isStarted) {
+                updateChunks();
+                let nextX = playerGroup.position.x;
+                let nextY = playerGroup.position.y;
+                let nextZ = playerGroup.position.z;
+
+                const speed = isFlying ? GAME_CONFIG.flySpeed : GAME_CONFIG.moveSpeed;
+                const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(playerGroup.quaternion);
+                const strafe = new THREE.Vector3(1, 0, 0).applyQuaternion(playerGroup.quaternion);
+
+                let moveX = 0, moveZ = 0;
+                if (keys['KeyW']) { moveX += forward.x * speed; moveZ += forward.z * speed; }
+                if (keys['KeyS']) { moveX -= forward.x * speed; moveZ -= forward.z * speed; }
+                if (keys['KeyA']) { moveX -= strafe.x * speed; moveZ -= strafe.z * speed; }
+                if (keys['KeyD']) { moveX += strafe.x * speed; moveZ += strafe.z * speed; }
+
+                if (!checkCollisionXZ(nextX + moveX, nextZ, nextY)) nextX += moveX;
+                if (!checkCollisionXZ(nextX, nextZ + moveZ, nextY)) nextZ += moveZ;
+
+                if (isFlying) {
+                    if (keys['Space']) nextY += GAME_CONFIG.flySpeed;
+                    if (keys['ShiftLeft']) nextY -= GAME_CONFIG.flySpeed;
+                    velocityY = 0;
+                } else {
+                    velocityY += GAME_CONFIG.gravity;
+                    nextY += velocityY;
+                    const vCol = checkVerticalCollision(nextY);
+                    nextY = vCol.y;
+                    isGrounded = vCol.grounded;
+                    if (vCol.grounded) velocityY = 0;
+                    if (keys['Space'] && isGrounded) velocityY = GAME_CONFIG.jumpPower;
+                }
+
+                playerGroup.position.set(nextX, nextY, nextZ);
+                
+                if (screenShake > 0) {
+                    camera.position.x = (Math.random() - 0.5) * screenShake;
+                    camera.position.y = (Math.random() - 0.5) * screenShake;
+                } else camera.position.set(0, 0, 0);
+
+                // --- ROTATING HOLOGRAM SYSTEM FOR ROOM IDs ---
+                scene.traverse(child => {
+                    if (child.name && child.name.startsWith("room_id_")) {
+                        child.rotation.y += deltaTime * 0.6; // Constant smooth rotation
+                    }
+                });
+                
+                updateInteractiveEntities(deltaTime);
+                flashlight.intensity = GAME_CONFIG.flashlightIntensity * flashlightFlicker;
+            }
+            renderer.render(scene, camera);
+        }
+
+        window.onkeydown = (e) => {
+            keys[e.code] = true;
+            if (e.code === 'KeyC' && isStarted && GAME_CONFIG.enableCreativeKey) {
+                isCreativeMode = !isCreativeMode;
+                isFlying = isCreativeMode;
+                ambientLight.intensity = isCreativeMode ? GAME_CONFIG.creativeAmbient : GAME_CONFIG.standardAmbient;
+                scene.fog = isCreativeMode ? null : new THREE.Fog(0x000000, 1, 140);
+            }
+            if (e.code === 'Space') {
+                const now = Date.now();
+                if (now - lastSpaceTime < 400 && isCreativeMode) {
+                    isFlying = !isFlying;
+                    lastSpaceTime = 0;
+                } else lastSpaceTime = now;
+            }
+        };
+        window.onkeyup = (e) => keys[e.code] = false;
+        document.getElementById('start-btn').onclick = () => {
+            isStarted = true;
+            document.body.requestPointerLock();
+            document.getElementById('ui').style.opacity = '0';
+            setTimeout(() => document.getElementById('ui').style.display = 'none', 1000);
+        };
+        window.onload = () => { init(); animate(); };
+        window.onresize = () => {
+            if (camera && renderer) {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            }
+        };
+    </script>
+</body>
+</html>
